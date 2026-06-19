@@ -239,6 +239,18 @@ pub struct InstalledPackageState {
     pub package_json_path: String,
     #[serde(default)]
     pub package_json_hash: String,
+    /// `(size, mtime)` of the materialized `package.json` at the last
+    /// install, mirroring [`FreshnessState::package_json_meta`]'s fast
+    /// path. Lets [`verify_install_layout`] skip the BLAKE3 re-hash when
+    /// the file is byte-identical: stat once, compare both fields, only
+    /// re-hash on a mtime or size change. The materialized manifest is a
+    /// hardlink/reflink into the immutable CAS store (written once, never
+    /// edited in place), so a matching `(size, mtime)` is sufficient
+    /// evidence it is unchanged. Missing field (older state files)
+    /// defaults to `None` → falls through to the existing hash path, so
+    /// upgrades stay valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_json_meta: Option<FileMeta>,
     /// `link:` dependency — materialized as a bare symlink to an
     /// arbitrary on-disk directory (often a sibling's build output that
     /// may not exist yet). The symlink's own presence is verified via
@@ -980,6 +992,7 @@ impl InstallLayoutState {
                     version: pkg.version.clone(),
                     package_json_path: relative_path_or_original(&package_json_path, project_dir),
                     package_json_hash: hash_file_if_exists(&package_json_path).unwrap_or_default(),
+                    package_json_meta: FileMeta::capture(&package_json_path),
                     link: is_link,
                 },
             );
@@ -1025,6 +1038,21 @@ fn verify_install_layout(
             continue;
         }
         let pkg_json_path = project_dir.join(&pkg.package_json_path);
+        // Fast path: if a `(size, mtime)` snapshot was recorded last
+        // install AND it still matches, the materialized manifest is
+        // byte-identical (it is a hardlink/reflink into the immutable CAS
+        // store, never edited in place), so skip the BLAKE3 hash. This
+        // mirrors `package_jsons_stale`'s mtime fast path; on a project
+        // with many direct deps it collapses one BLAKE3 hash per direct
+        // dep into one stat per direct dep on every warm/no-op install
+        // and every `aube run` startup. Falls through to the hash path on
+        // older state files (`package_json_meta` is `None`).
+        if let Some(stored_meta) = pkg.package_json_meta.as_ref()
+            && let Some(current_meta) = FileMeta::capture(&pkg_json_path)
+            && current_meta == *stored_meta
+        {
+            continue;
+        }
         let current_hash = hash_file_if_exists(&pkg_json_path);
         if let Some(current_hash) = current_hash
             && !pkg.package_json_hash.is_empty()
@@ -1330,7 +1358,7 @@ fn empty_blake3_hash() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallLayoutMode, InstallLayoutState, InstallState, InstalledPackageState,
+        FileMeta, InstallLayoutMode, InstallLayoutState, InstallState, InstalledPackageState,
         collect_package_json_hashes_from_manifests, empty_blake3_hash, fresh_state_file, hash_file,
         hash_settings, install_state_file, member_lockfiles_stale, read_or_migrate_fresh_state,
         relative_path_or_original, remove_state, verify_install_layout,
@@ -1378,6 +1406,7 @@ mod tests {
                             "node_modules/.aube/missing/node_modules/is-odd/package.json"
                                 .to_string(),
                         package_json_hash: empty_blake3_hash().to_string(),
+                        package_json_meta: None,
                         link: false,
                     },
                 )]),
@@ -1424,6 +1453,7 @@ mod tests {
                     version: "0.0.0".to_string(),
                     package_json_path: "../api/dist/package.json".to_string(),
                     package_json_hash: String::new(),
+                    package_json_meta: None,
                     link: true,
                 },
             )]),
@@ -1452,6 +1482,60 @@ mod tests {
         assert_eq!(
             verify_install_layout(&project_dir, Some(&state)),
             Some("installed entry missing: node_modules/@scope/api".to_string())
+        );
+    }
+
+    /// When a `(size, mtime)` snapshot was recorded for an installed
+    /// package's `package.json` and still matches the on-disk file, the
+    /// layout check skips the BLAKE3 re-hash entirely — proven here by
+    /// storing a deliberately wrong `package_json_hash` alongside a
+    /// matching `package_json_meta`: the meta fast path keeps the project
+    /// warm without ever consulting the (mismatched) hash. A stale meta
+    /// (size bumped) falls through to the hash path and busts.
+    #[test]
+    fn verify_install_layout_meta_fast_path_skips_hash() {
+        let project_dir = temp_project_dir("layout-meta-fastpath");
+        let pkg_rel = "node_modules/.aube/node_modules/dep/package.json";
+        let pkg_path = project_dir.join(pkg_rel);
+        std::fs::create_dir_all(pkg_path.parent().expect("parent"))
+            .expect("dep dir should write");
+        std::fs::write(&pkg_path, r#"{"name":"dep","version":"1.0.0"}"#)
+            .expect("package.json should write");
+
+        let meta = FileMeta::capture(&pkg_path).expect("meta should capture");
+        // Stored version is deliberately stale ("9.9.9") and the stored
+        // hash is deliberately wrong: a matching meta must keep the
+        // project warm WITHOUT consulting either, but a stale meta must
+        // fall through and bust on the version mismatch.
+        let warm_pkg = |meta: Option<FileMeta>| InstalledPackageState {
+            name: "dep".to_string(),
+            version: "9.9.9".to_string(),
+            package_json_path: pkg_rel.to_string(),
+            package_json_hash: "blake3:deadbeef".to_string(),
+            package_json_meta: meta,
+            link: false,
+        };
+        let layout = |meta: Option<FileMeta>| InstallLayoutState {
+            linker: InstallLayoutMode::Isolated,
+            direct_entries: BTreeMap::new(),
+            packages: BTreeMap::from([("dep@9.9.9".to_string(), warm_pkg(meta))]),
+        };
+
+        // Matching meta → warm, neither hash nor manifest version consulted.
+        assert_eq!(
+            verify_install_layout(&project_dir, Some(&layout(Some(meta.clone())))),
+            None
+        );
+
+        // Stale meta (size mismatch) → falls through, hash mismatches, reads
+        // the manifest, version differs from the stored "9.9.9" → busts.
+        let stale = FileMeta {
+            size: meta.size + 1,
+            ..meta
+        };
+        assert_eq!(
+            verify_install_layout(&project_dir, Some(&layout(Some(stale)))),
+            Some("installed package metadata changed: node_modules/.aube/node_modules/dep/package.json".to_string())
         );
     }
 
