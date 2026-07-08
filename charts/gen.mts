@@ -187,7 +187,28 @@ function storeChart() {
     out.push(rich(PAD, fy, l, 15.5, C.muted))
     fy += 25
   }
-  const H = Math.round(fy - 25 + 34)
+
+  // Write-cost callout — one measured panel for the store-write side (read-side
+  // numbers are the bars above). decmpfs's LZVN block compression is now
+  // parallelized; the write is a one-time install cost. Panel + green accent set
+  // it apart from the prose footer without inventing per-addon write bars.
+  const calloutLines = [
+    [{ t: 'Write cost (once, at install)', b: 1 }, { t: ' — decmpfs on APFS, 40 MB @rspack/binding addon: ' }, { t: '42 ms', b: 1 }, { t: ' compressed vs ' }, { t: '21 ms', b: 1 }, { t: ' plain cp (~2×).' }],
+    [{ t: 'Parallel LZVN block compression — ' }, { t: '6.5× faster', b: 1 }, { t: ' than naive serial (275 → 42 ms). darwin-arm64.' }],
+  ]
+  const calloutTop = fy - 25 + 22
+  const calloutPadX = 20
+  const calloutLineH = 24
+  const calloutH = 24 + calloutLines.length * calloutLineH
+  out.push(rect(PAD, calloutTop, W - 2 * PAD, calloutH, C.codeBg, 10))
+  out.push(rect(PAD, calloutTop, 4, calloutH, C.green, 2))
+  let cy = calloutTop + 30
+  for (const l of calloutLines) {
+    out.push(rich(PAD + calloutPadX, cy, l, 15.5, C.muted))
+    cy += calloutLineH
+  }
+
+  const H = Math.round(calloutTop + calloutH + 32)
   return frame(W, H, grid.join('\n') + '\n' + out.join('\n'))
 }
 
