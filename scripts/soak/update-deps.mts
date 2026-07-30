@@ -1,0 +1,169 @@
+#!/usr/bin/env node
+/**
+ * @file Soaked dependency updater — every ecosystem bumps through the same
+ *   cooldown:
+ *
+ *   - npm: taze (maturityPeriod = SOAK_DAYS via the taze config next to the
+ *     package.json) rewrites ranges, then the repo's own installer refreshes
+ *     the lockfile.
+ *   - cargo: `cargo +nightly update`, where `.cargo/config.toml`
+ *     min-publish-age enforces the same window (too-new crate versions are
+ *     skipped unless already locked). The nightly is requested per-invocation
+ *     rather than pinned repo-wide — see .cargo/config.toml for why.
+ *
+ *   Usage: node scripts/soak/update-deps.mts [--npm|--cargo] [--dry-run]
+ *   (no ecosystem flag = both)
+ */
+
+import { spawnSync } from 'node:child_process'
+import { existsSync, realpathSync } from 'node:fs'
+import path from 'node:path'
+import process from 'node:process'
+import { pathToFileURL } from 'node:url'
+
+import { NPM_INSTALLERS, NPM_PKG_DIR, REPO_ROOT, RUSTUP_CARGO } from './paths.mts'
+
+function run(cmd: string, args: string[], cwd: string): number {
+  console.log(`[update-deps] ${cmd} ${args.join(' ')} (in ${path.relative(REPO_ROOT, cwd) || '.'})`)
+  const res = spawnSync(cmd, args, { cwd, stdio: 'inherit' })
+  if (res.error) {
+    console.error(`[update-deps] ${cmd}: ${res.error.message}`)
+  }
+  return res.status ?? 1
+}
+
+function updateNpm(dryRun: boolean): number {
+  const taze = path.join(NPM_PKG_DIR, 'node_modules/.bin/taze')
+  if (!existsSync(taze)) {
+    console.error(`[update-deps] taze not installed — run the installer in ${NPM_PKG_DIR} first`)
+    return 1
+  }
+  // The taze config sets `write: true`; a dry run must override it
+  // explicitly or "dry" would still rewrite package.json.
+  const args = dryRun ? ['--no-write', '--no-install'] : ['--write']
+  const status = run(taze, args, NPM_PKG_DIR)
+  if (status !== 0 || dryRun) {
+    return status
+  }
+  for (const [cmd, ...args] of NPM_INSTALLERS) {
+    if (cmd!.includes('/') && !existsSync(cmd!)) {
+      continue
+    }
+    return run(cmd!, args, NPM_PKG_DIR)
+  }
+  console.error('[update-deps] no installer found — refresh the lockfile manually')
+  return 1
+}
+
+function updateCargo(dryRun: boolean): number {
+  // The min-publish-age soak is an [unstable] cargo feature, honored only
+  // under a nightly cargo. The repo pins no nightly toolchain (that would
+  // outrank `rustup default` and silently redirect the version-pinned CI
+  // jobs and the release build), so the nightly is requested explicitly
+  // HERE — dependency resolution is the only step that picks versions, so
+  // it is the only step that needs the soak. `+nightly` is rustup shim
+  // syntax; a non-rustup cargo (e.g. Homebrew stable) would silently
+  // update WITHOUT the soak, so refuse that rather than bypass it.
+  if (!existsSync(RUSTUP_CARGO)) {
+    console.error('[update-deps] rustup cargo shim not found — cargo update would bypass the min-publish-age soak')
+    return 1
+  }
+  const args = dryRun ? ['+nightly', 'update', '--dry-run'] : ['+nightly', 'update']
+  // VERIFY the soak actually applied. `[unstable] min-publish-age` is a
+  // warning-only unused key on any cargo that does not implement it, so a
+  // merely-OLD nightly updates every crate with no window at all,
+  // silently, and the run still exits 0. Measured both sides:
+  //   - nightly 2026-03-21 (cargo 1.96.0-nightly): no such -Z, key unused
+  //   - nightly 2026-07-27 (cargo 1.99.0-nightly): -Z min-publish-age
+  //     present, and resolution visibly holds a too-fresh release back
+  //     ("available: v0.2.189, published 7 days ago")
+  // Capture stderr and treat the warning as a failure: claiming a
+  // protection we did not apply is worse than no protection.
+  console.log(`[update-deps] ${RUSTUP_CARGO} ${args.join(' ')} (in .)`)
+  const res = spawnSync(RUSTUP_CARGO, args, {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    stdio: ['inherit', 'inherit', 'pipe'],
+  })
+  const stderr = res.stderr ?? ''
+  process.stderr.write(stderr)
+  if (res.error) {
+    console.error(`[update-deps] ${RUSTUP_CARGO}: ${res.error.message}`)
+    return 1
+  }
+  // The window can make re-resolution IMPOSSIBLE rather than merely
+  // holding a version back: if a requirement's only matching release is
+  // younger than the window (e.g. `pkg = "^4"` when 4.0.0 shipped 3 days
+  // ago), cargo fails the whole update. That is the soak doing its job,
+  // but cargo's own help line advertises
+  // CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow — a blanket env-var
+  // bypass this design deliberately does not have. Say so before someone
+  // copy-pastes it out of a red terminal.
+  if (isBlockedByPublishAge(stderr)) {
+    console.error(
+      '[update-deps] the cargo soak BLOCKED this re-resolution: a requirement can\n' +
+        '  only be satisfied by a release younger than the window (see the error above).\n' +
+        '  This is the window working, not a bug. Options, in order of preference:\n' +
+        '    1. wait out the remaining days and re-run;\n' +
+        '    2. relax/repin the requirement so an already-soaked version satisfies it;\n' +
+        '    3. if the fresh release is genuinely required, adopt it as a deliberate,\n' +
+        '       reviewable commit — NOT via CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE,\n' +
+        '       which silently disables the window for every crate in the graph.',
+    )
+    return res.status ?? 1
+  }
+  if (isMinPublishAgeUnsupported(stderr)) {
+    console.error(
+      '[update-deps] cargo ignored [unstable] min-publish-age — this nightly does not\n' +
+        '  implement it, so the update ran with NO soak window. Update the nightly\n' +
+        '  (`rustup update nightly`) and re-run; the lockfile changes are unsoaked.',
+    )
+    return 1
+  }
+  return res.status ?? 1
+}
+
+/**
+ * cargo emits `unused config key ...` (a warning, exit 0) for an
+ * `[unstable]` key it does not implement, so the ONLY signal that the soak
+ * silently did not apply is this line on stderr. Exported for the tests.
+ */
+export function isMinPublishAgeUnsupported(stderr: string): boolean {
+  return /unused config key `unstable\.min-publish-age`/.test(stderr)
+}
+
+/**
+ * cargo's resolver failure when a requirement's only candidate is inside
+ * the window: `version X is too new (published N days ago, minimum age M
+ * days)`. Exported for the tests; pins cargo's wording.
+ */
+export function isBlockedByPublishAge(stderr: string): boolean {
+  return /is too new \(published .*minimum age/.test(stderr)
+}
+
+// No flag = both; naming both explicitly also means both — a naive
+// "flag present = only that one" reading once made `--npm --cargo` run
+// NEITHER, so this rule lives in one exported, regression-tested place.
+export function selectEcosystems(argv: string[]): { npm: boolean; cargo: boolean } {
+  const npmFlag = argv.includes('--npm')
+  const cargoFlag = argv.includes('--cargo')
+  return { npm: npmFlag || !cargoFlag, cargo: cargoFlag || !npmFlag }
+}
+
+function main(argv: string[] = process.argv.slice(2)): number {
+  const dryRun = argv.includes('--dry-run')
+  const { npm, cargo } = selectEcosystems(argv)
+  // Run every requested ecosystem even if an earlier one fails, then
+  // aggregate, so one broken ecosystem can't hide the other's drift.
+  const npmStatus = npm ? updateNpm(dryRun) : 0
+  const cargoStatus = cargo ? updateCargo(dryRun) : 0
+  return npmStatus || cargoStatus
+}
+
+// realpath + pathToFileURL so symlinked checkouts and paths needing URL
+// encoding still register as the entrypoint (ESM realpaths import.meta.url).
+const isMain =
+  process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url
+if (isMain) {
+  process.exitCode = main()
+}
