@@ -91,7 +91,8 @@ jobs:
           github-cache-mode: objects
           cache-generation: blaze-nightly-2026-10-25
       - run: node benchmarks/validate-results.mts
-      - run: mise run test
+      - name: Test with Blaze, then run doctests with rustdoc
+        run: mise exec -- sh scripts/setup-blaze.sh sh scripts/test-ci.sh
       # online jactionlint checks (impostor commits, known-vulnerable actions, ...) run in CI only
       - run: mise run lint
         env:
